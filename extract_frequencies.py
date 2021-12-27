@@ -204,7 +204,7 @@ if __name__ == "__main__":
                          help="Only process files with this extension (must include a dot).")
     cextract.add_argument("-o", "--outfile", default="extractor.pckl",
                          help="Path of the output file to save the final object and all frequencies to. If not given, writes to extractor.pckl.")
-    cextract.add_argument("-b", "--batch_size", default=64, help="Mini-batch size to process at a time. Larger = faster but may lead to out of memory issues.")
+    cextract.add_argument("-b", "--batch_size", default=64, type=int, help="Mini-batch size to process at a time. Larger = faster but may lead to out of memory issues.")
     cextract.add_argument("-v", "--verbose", action="store_true", help="Print information of matching tokens.")
 
     ccollect = csubparsers.add_parser("collect")
