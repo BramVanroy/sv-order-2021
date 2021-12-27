@@ -1,11 +1,11 @@
 """
 Data used: SONAR, excluding the written-to-be-spoken components starting with WS-
 """
-import pickle
 from collections import Counter
 from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
+import pickle
 from typing import Dict, Union
 
 import ftfy
@@ -14,11 +14,13 @@ import spacy
 from spacy import Language
 from spacy.tokens import Doc
 from spacy.util import minibatch
+import torch
 from tqdm import tqdm
 
 using_gpu = spacy.prefer_gpu()
 
-print("USING GPU?", using_gpu)
+print("USING GPU? (spaCy)", using_gpu)
+print("USING GPU? (torch)", torch.cuda.is_available())
 
 
 @dataclass
@@ -26,6 +28,7 @@ class Extractor:
     indir: Union[str, PathLike] = field(default=None)
     ext: str = field(default="")
     outfile: str = field(default="extractor.pckl")
+    batch_size: int = 64
     verbose: bool = False
 
     dep_token_c: Dict = field(default_factory=dict, init=False)
@@ -91,12 +94,14 @@ class Extractor:
 
     def calculate_statistics(self):
         # Disable sentence segmentation
+        # Install with
+        # python -m pip install https://huggingface.co/explosion/nl_udv25_dutchalpino_trf/resolve/main/nl_udv25_dutchalpino_trf-any-py3-none-any.whl
         nlp = spacy.load("nl_udv25_dutchalpino_trf", exclude=["senter", "sentencizer"])
         nlp.add_pipe("disable_sbd", before="parser")
 
-        for pfin in tqdm(self.files, position=0, desc="File"):
+        for pfin in tqdm(self.files, desc="File"):
             lines = self.lines(pfin)
-            for batch in tqdm(minibatch(lines, size=64), total=len(lines)//64, position=0, desc="Batch"):
+            for batch in tqdm(minibatch(lines, size=self.batch_size), total=len(lines)//self.batch_size, leave=False, desc="Batch"):
                 docs = nlp.pipe(batch)
                 for doc in docs:
                     if self.verbose:
@@ -199,6 +204,7 @@ if __name__ == "__main__":
                          help="Only process files with this extension (must include a dot).")
     cextract.add_argument("-o", "--outfile", default="extractor.pckl",
                          help="Path of the output file to save the final object and all frequencies to. If not given, writes to extractor.pckl.")
+    cextract.add_argument("-b", "--batch_size", default=64, help="Mini-batch size to process at a time. Larger = faster but may lead to out of memory issues.")
     cextract.add_argument("-v", "--verbose", action="store_true", help="Print information of matching tokens.")
 
     ccollect = csubparsers.add_parser("collect")
