@@ -1,13 +1,14 @@
 """Get relevant data from TMX/XML and save as tab-separated file. Meant to be run on TMX files and extracting
 linguistic features for both French (src) and Dutch (tgt).
 """
+
 from os import PathLike
 from pathlib import Path
 from typing import Union
-from xml.etree.ElementTree import Element, ElementTree
 
 import lxml
 from lxml import etree
+from lxml.etree import ElementTree, Element
 from pandas import DataFrame
 
 
