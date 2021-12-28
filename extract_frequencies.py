@@ -1,9 +1,9 @@
 """
 Data used: SONAR, excluding the written-to-be-spoken components starting with WS-
 """
-import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+import multiprocessing as mp
 from multiprocessing import Manager, Process, Queue
 from os import PathLike
 from pathlib import Path
@@ -272,6 +272,10 @@ class SpacyDisableSentenceSegmentation:
 
 
 if __name__ == "__main__":
+    # This is required, see https://datascience.stackexchange.com/a/98195/32669
+    # And must be inside if name==main, see https://docs.python.org/3/library/multiprocessing.html#multiprocessing.set_start_method
+    mp.set_start_method("spawn", force=True)
+
     import argparse
 
     cparser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
