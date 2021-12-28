@@ -38,32 +38,33 @@ class FrequencyExtractor:
     indir: Union[str, PathLike] = field(default=None, compare=False)
     ext: str = field(default="", compare=False)
     batch_size: int = field(default=64, compare=False)
-    n_workers: int = field(default=1, compare=False)
+    n_workers: int = field(default=None, compare=False)
     verbose: bool = field(default=False, compare=False)
-    no_cuda: bool = field(default=False, compare=False)
+    n_gpus: int = field(default=0, compare=False)
 
     dep_token_c: Dict = field(default_factory=dict, init=False)
     dep_lemma_c: Dict = field(default_factory=dict, init=False)
     verb_token_c: Dict = field(default_factory=dict, init=False)
     verb_lemma_c: Dict = field(default_factory=dict, init=False)
 
-    n_gpus: int = field(default=0, init=False, compare=False)
-
     results_q: Optional[Queue] = field(default=None, init=False, repr=False, compare=False)
     work_q: Optional[Queue] = field(default=None, init=False, repr=False, compare=False)
+    no_cuda: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         self.files = list(Path(self.indir).glob(f"*{self.ext}"))
         self.verb_token_c = {"pre": Counter(), "post": Counter()}
         self.verb_lemma_c = {"pre": Counter(), "post": Counter()}
-        if (not CUPY_AVAILABLE or not TORCH_CUDA_AVAILABLE) and not self.no_cuda:
+        if (not CUPY_AVAILABLE or not TORCH_CUDA_AVAILABLE) and self.n_gpus > 0:
             logging.warning(f"CUDA requested, but environment does not support it! Disabling...\n"
                             f"\t- CUPY AVAILABLE: {CUPY_AVAILABLE}\n\t- TORCH CUDA AVAILABLE: {TORCH_CUDA_AVAILABLE}")
-            torch.device("cpu")
-            self.no_cuda = True
-        else:
-            self.n_gpus = cupy.cuda.runtime.getDeviceCount()
+            self.n_gpus = 0
 
+        # If n_workers not set, set it to 1 or n_gpus, whichever is highest
+        if self.n_workers is None:
+            self.n_workers = max(1, self.n_gpus)
+
+        self.no_cuda = self.n_gpus < 1
         self.process_dir()
 
     @staticmethod
@@ -297,13 +298,16 @@ if __name__ == "__main__":
     cparser.add_argument("-b", "--batch_size", default=64, type=int,
                          help="Mini-batch size to process at a time.Larger = faster but may lead to out"
                               " of memory issues.")
-    cparser.add_argument("-n", "--n_workers", default=1, type=int,
-                         help="Number of workers to use. Note that if CUDA is enabled (default), the workers will"
-                              " automatically be distributed across all available GPUs!")
+    cparser.add_argument("-n", "--n_workers", default=None, type=int,
+                         help="Number of workers to use. If not given, it will be set to 'n_gpus'. If CUDA is not"
+                              " available (or n_gpus=0), it will be set to 1. Note that if n_workers > n_gpus,"
+                              " multiple processes will use the same GPU - which may lead to out-of-memory issues")
+    cparser.add_argument("--n_gpus", type=int, default=0,
+                         help="The number of GPUs to use. If n_workers is not specified, will set it to 'n_gpus'. "
+                              "If n_workers is specified and it is larger than n_gpus, multiple process will use the"
+                              " same GPU. To disable CUDA, set to 0.")
     cparser.add_argument("-v", "--verbose", action="store_true", default=False,
                          help="Print information of matching tokens.")
-    cparser.add_argument("--no_cuda", action="store_true", default=False,
-                         help="To disable CUDA. If CUDA-capable software is not detected, CUDA will not be used.")
 
     cargs = vars(cparser.parse_args())
     coutfile = cargs.pop("outfile")
