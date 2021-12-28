@@ -9,16 +9,17 @@ from multiprocessing import Manager, Process, Queue
 from os import PathLike
 from pathlib import Path
 import pickle
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 import warnings
 
 import ftfy
 import spacy
 import torch
-from spacy import Language
+from spacy import Language, Vocab
 from spacy.tokens import Doc
 from spacy.util import minibatch
-from thinc.api import set_gpu_allocator, require_gpu
+from thinc.api import require_gpu
+from thinc.backends import use_pytorch_for_gpu_memory
 from tqdm import tqdm
 
 # torch will complain if CUDA is not available in autocast:
@@ -33,6 +34,7 @@ except ImportError:
 
 TORCH_CUDA_AVAILABLE = torch.cuda.is_available()
 
+
 @dataclass
 class FrequencyExtractor:
     indir: Union[str, PathLike] = field(default=None, compare=False)
@@ -40,12 +42,17 @@ class FrequencyExtractor:
     batch_size: int = field(default=64, compare=False)
     n_workers: int = field(default=None, compare=False)
     verbose: bool = field(default=False, compare=False)
+    is_tokenized: bool = field(default=False, compare=False)
     n_gpus: int = field(default=0, compare=False)
+    min: int = field(default=0, compare=False)
+    max: int = field(default=0, compare=False)
 
     dep_token_c: Dict = field(default_factory=dict, init=False)
     dep_lemma_c: Dict = field(default_factory=dict, init=False)
     verb_token_c: Dict = field(default_factory=dict, init=False)
     verb_lemma_c: Dict = field(default_factory=dict, init=False)
+    n_tokens_processed: int = field(default=0, init=False)
+    n_sents_processed: int = field(default=0, init=False)
 
     results_q: Optional[Queue] = field(default=None, init=False, repr=False, compare=False)
     work_q: Optional[Queue] = field(default=None, init=False, repr=False, compare=False)
@@ -65,20 +72,25 @@ class FrequencyExtractor:
         if self.n_workers is None:
             self.n_workers = max(1, self.n_gpus)
 
+        if self.n_gpus > self.n_workers:
+            raise ValueError("'n_gpus must be equal to or less than 'n_workers'")
+
         self.no_cuda = self.n_gpus < 1
         self.process_dir()
 
-    @staticmethod
-    def filter_lines(ls):
+    def filter_lines(self, ls):
         lines = []
         for line in ls:
             line = ftfy.fix_text(line)
+            seq_len = len(line.split(" "))
+            # Skip short/long sequences
+            # If max not set (0), only check min (which is 0 by default)
+            if not self.max and self.min <= seq_len:
+                lines.append(line)
+            # If max is set, test both (min is always set to 0 as default so no problem)
+            elif self.min <= seq_len <= self.max:
+                lines.append(line)
 
-            # Skip short sequences
-            if len(line.split(" ")) < 3:
-                continue
-
-            lines.append(line)
         return lines
 
     def is_pre_or_post_subjs(self, doc: Doc):
@@ -117,12 +129,11 @@ class FrequencyExtractor:
         else:
             self.calculate_statistics_sp()
 
-        self.cleanup()
-        # `self` shoud now contain all the relevant data so we can now call `save` if we want
+        # `self` should now contain all the relevant data so we can now call `save` if we want
 
     def calculate_statistics_sp(self):
         self.set_cuda(0)
-        nlp = load_nlp()
+        nlp = self.load_nlp()
 
         for batch in self._reader():
             self.process_batch(batch, nlp, 0)
@@ -153,12 +164,11 @@ class FrequencyExtractor:
 
             reader_proc.join()
             reader_proc.terminate()
-
             self.merge_result_dicts(results)
 
     def _calculate_statistics_mp(self, rank, gpuid):
         self.set_cuda(gpuid)
-        nlp = load_nlp()
+        nlp = self.load_nlp()
 
         while True:
             # Get work from the working queue
@@ -171,12 +181,14 @@ class FrequencyExtractor:
         results = {"dep_token_c": self.dep_token_c,
                    "dep_lemma_c": self.dep_lemma_c,
                    "verb_token_c": self.verb_token_c,
-                   "verb_lemma_c": self.verb_lemma_c}
+                   "verb_lemma_c": self.verb_lemma_c,
+                   "n_tokens_processed": self.n_tokens_processed,
+                   "n_sents_processed": self.n_sents_processed}
+
         self.results_q.put(results)
 
     def process_batch(self, batch, nlp, rank=0):
         batch = self.filter_lines(batch)
-
         docs = nlp.pipe(batch, batch_size=self.batch_size)
         for doc in docs:
             if self.verbose and rank == 0:
@@ -199,6 +211,7 @@ class FrequencyExtractor:
                     self.dep_lemma_c[token.dep_.lower()] = Counter()
                 self.dep_lemma_c[token.dep_.lower()][token.lemma_.lower()] += 1
 
+
             # An approximation of sentences that contain "non main clauses", i.e. "complex clauses"
             # As taken from the UD documentation: https://universaldependencies.org/u/overview/complex-syntax.html
             if not any(t.dep_.lower() in ("csubj", "xcomp", "ccomp", "advcl", "acl", "conj", "acl:relcl") for
@@ -214,6 +227,9 @@ class FrequencyExtractor:
 
                     if self.verbose and rank == 0:
                         print(subj_position, pv, subj)
+
+            self.n_tokens_processed += len(doc)
+            self.n_sents_processed += 1
 
             if self.verbose and rank == 0:
                 print()
@@ -241,32 +257,37 @@ class FrequencyExtractor:
         self.verb_token_c = verb_token_c
         self.verb_lemma_c = verb_lemma_c
 
-    def cleanup(self):
-        self.results_q = None
-        self.work_q = None
+        self.n_tokens_processed = sum([d["n_tokens_processed"] for d in results])
+        self.n_sents_processed = sum([d["n_sents_processed"] for d in results])
+
+    def load_nlp(self):
+        # Install with
+        # python -m pip install https://huggingface.co/explosion/nl_udv25_dutchalpino_trf/resolve/main/nl_udv25_dutchalpino_trf-any-py3-none-any.whl
+        nlp = spacy.load("nl_udv25_dutchalpino_trf", exclude=["senter", "sentencizer", "ner", "textcat"])
+        nlp.add_pipe("disable_sbd", before="parser")
+
+        if self.is_tokenized:
+            pipe_name = next(pipe for pipe in nlp.pipe_names if "tokenizer" in pipe)
+            setattr(nlp, pipe_name, PretokenizedTokenizer(nlp.vocab))
+
+        return nlp
 
     def set_cuda(self, gpuid):
         if not self.no_cuda:
             cupy.cuda.Device(gpuid).use()
-            set_gpu_allocator("pytorch")
+            use_pytorch_for_gpu_memory()
             require_gpu(gpuid)
 
-    def save(self, outfile: Union[str, PathLike]="extractor.pckl"):
+    def save(self, outfile: Union[str, PathLike] = "extractor.pckl"):
         results = {"dep_token_c": self.dep_token_c,
                    "dep_lemma_c": self.dep_lemma_c,
                    "verb_token_c": self.verb_token_c,
-                   "verb_lemma_c": self.verb_lemma_c}
+                   "verb_lemma_c": self.verb_lemma_c,
+                   "n_tokens_processed": self.n_tokens_processed,
+                   "n_sents_processed": self.n_sents_processed}
 
         with open(outfile, "wb") as fhout:
             pickle.dump(results, fhout)
-
-
-def load_nlp():
-    # Install with
-    # python -m pip install https://huggingface.co/explosion/nl_udv25_dutchalpino_trf/resolve/main/nl_udv25_dutchalpino_trf-any-py3-none-any.whl
-    nlp = spacy.load("nl_udv25_dutchalpino_trf", exclude=["senter", "sentencizer", "ner", "textcat"])
-    nlp.add_pipe("disable_sbd", before="parser")
-    return nlp
 
 
 @Language.factory("disable_sbd")
@@ -282,6 +303,24 @@ class SpacyDisableSentenceSegmentation:
         for token in doc:
             token.is_sent_start = False
         return doc
+
+
+class PretokenizedTokenizer:
+    """Custom tokenizer to be used in spaCy when the text is already pretokenized."""
+    def __init__(self, vocab: Vocab):
+        """Initialize tokenizer with a given vocab
+        :param vocab: an existing vocabulary (see https://spacy.io/api/vocab)
+        """
+        self.vocab = vocab
+
+    def __call__(self, inp: Union[List[str], str]) -> Doc:
+        """Call the tokenizer on input `inp`.
+        :param inp: either a string to be split on whitespace, or a list of tokens
+        :return: the created Doc object
+        """
+        words = inp.split()
+        spaces = [True] * (len(words) - 1) + ([True] if inp[-1].isspace() else [False])
+        return Doc(self.vocab, words=words, spaces=spaces)
 
 
 if __name__ == "__main__":
@@ -311,6 +350,12 @@ if __name__ == "__main__":
                          help="The number of GPUs to use. If n_workers is not specified, will set it to 'n_gpus'. "
                               "If n_workers is specified and it is larger than n_gpus, multiple process will use the"
                               " same GPU. To disable CUDA, set to 0.")
+    cparser.add_argument("--is_tokenized", action="store_true", default=False,
+                         help="Whether the input data is pretokenized.")
+    cparser.add_argument("--min", type=int, default=0,
+                         help="Lines with less than 'min' whitespace-separated tokens will not be processed.")
+    cparser.add_argument("--max", type=int, default=0,
+                         help="Lines with more than 'max' whitespace-separated tokens will not be processed. Set to 0 to disable")
     cparser.add_argument("-v", "--verbose", action="store_true", default=False,
                          help="Print information of matching tokens.")
 
