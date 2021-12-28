@@ -1,6 +1,7 @@
 """
 Data used: SONAR, excluding the written-to-be-spoken components starting with WS-
 """
+import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 import multiprocessing as mp
@@ -13,6 +14,7 @@ import warnings
 
 import ftfy
 import spacy
+import torch
 from spacy import Language
 from spacy.tokens import Doc
 from spacy.util import minibatch
@@ -23,6 +25,13 @@ from tqdm import tqdm
 # https://github.com/pytorch/pytorch/issues/67598
 warnings.filterwarnings("ignore", category=UserWarning, module="torch")
 
+try:
+    import cupy
+    CUPY_AVAILABLE = True
+except ImportError:
+    CUPY_AVAILABLE = False
+
+TORCH_CUDA_AVAILABLE = torch.cuda.is_available()
 
 @dataclass
 class FrequencyExtractor:
@@ -46,6 +55,11 @@ class FrequencyExtractor:
         self.files = list(Path(self.indir).glob(f"*{self.ext}"))
         self.verb_token_c = {"pre": Counter(), "post": Counter()}
         self.verb_lemma_c = {"pre": Counter(), "post": Counter()}
+
+        if (not CUPY_AVAILABLE or not TORCH_CUDA_AVAILABLE) and self.n_gpus > 0:
+            logging.warning(f"CUDA requested, but environment does not support it! Disabling...\n"
+                            f"\t- CUPY AVAILABLE: {CUPY_AVAILABLE}\n\t- TORCH CUDA AVAILABLE: {TORCH_CUDA_AVAILABLE}")
+            self.n_gpus = 0
 
         # If n_workers not set, set it to 1 or n_gpus, whichever is highest
         if self.n_workers is None:
@@ -233,7 +247,6 @@ class FrequencyExtractor:
 
     def set_cuda(self, gpuid):
         if not self.no_cuda:
-            import cupy
             cupy.cuda.Device(gpuid).use()
             set_gpu_allocator("pytorch")
             require_gpu(gpuid)
