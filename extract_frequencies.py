@@ -1,70 +1,75 @@
 """
 Data used: SONAR, excluding the written-to-be-spoken components starting with WS-
 """
-from collections import Counter
+import logging
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from multiprocessing import Manager, Process, Queue
 from os import PathLike
 from pathlib import Path
 import pickle
-from typing import Dict, Union
+from typing import Dict, Optional, Union
+import warnings
 
 import ftfy
-import pandas as pd
 import spacy
 from spacy import Language
 from spacy.tokens import Doc
 from spacy.util import minibatch
+from thinc.api import set_gpu_allocator, require_gpu
 import torch
 from tqdm import tqdm
 
-using_gpu = spacy.prefer_gpu()
+try:
+    import cupy
+    CUPY_AVAILABLE = True
+except ImportError:
+    CUPY_AVAILABLE = False
 
-print("USING GPU? (spaCy)", using_gpu)
-print("USING GPU? (torch)", torch.cuda.is_available())
+TORCH_CUDA_AVAILABLE = torch.cuda.is_available()
+
+# torch will complain if CUDA is not available in autocast:
+# https://github.com/pytorch/pytorch/issues/67598
+warnings.filterwarnings("ignore", category=UserWarning, module="torch")
 
 
 @dataclass
-class Extractor:
-    indir: Union[str, PathLike] = field(default=None)
-    ext: str = field(default="")
-    outfile: str = field(default="extractor.pckl")
-    batch_size: int = 64
-    verbose: bool = False
+class FrequencyExtractor:
+    indir: Union[str, PathLike] = field(default=None, compare=False)
+    ext: str = field(default="", compare=False)
+    batch_size: int = field(default=64, compare=False)
+    n_workers: int = field(default=1, compare=False)
+    verbose: bool = field(default=False, compare=False)
+    no_cuda: bool = field(default=False, compare=False)
 
     dep_token_c: Dict = field(default_factory=dict, init=False)
     dep_lemma_c: Dict = field(default_factory=dict, init=False)
+    verb_token_c: Dict = field(default_factory=dict, init=False)
+    verb_lemma_c: Dict = field(default_factory=dict, init=False)
+
+    n_gpus: int = field(default=0, init=False, compare=False)
+
+    results_q: Optional[Queue] = field(default=None, init=False, repr=False, compare=False)
+    work_q: Optional[Queue] = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         self.files = list(Path(self.indir).glob(f"*{self.ext}"))
         self.verb_token_c = {"pre": Counter(), "post": Counter()}
         self.verb_lemma_c = {"pre": Counter(), "post": Counter()}
-
-        self.calculate_statistics()
-
-    def get_n(self, dep=None, unique=False, kind="tokens"):
-        """If dep is None, gets the total number of tokens or lemmas. If dep is given, then return the total number of
-         tokens or lemmas for that given category.
-        If unique is false, then counts for lemmas and tokens are identical (as it is equal to the total number
-        of words)."""
-        d = self.dep_token_c if kind == "tokens" else self.dep_lemma_c
-        if unique:
-            # Only count unique tokens _per dep category_. So if a token occurs twice as verb and thrice as noun
-            # we count it once as verb and once as noun!
-            if dep is None:
-                return sum([len(c.keys()) for c in d.values()])
-            else:
-                return len(d[dep].keys())
+        if (not CUPY_AVAILABLE or not TORCH_CUDA_AVAILABLE) and not self.no_cuda:
+            logging.warning(f"CUDA requested, but environment does not support it! Disabling...\n"
+                            f"\t- CUPY AVAILABLE: {CUPY_AVAILABLE}\n\t- TORCH CUDA AVAILABLE: {TORCH_CUDA_AVAILABLE}")
+            torch.device("cpu")
+            self.no_cuda = True
         else:
-            # Not unique. So if a token occurs twice as a verb, we count it as such!
-            if dep is None:
-                return sum([sum(c.values()) for c in d.values()])
-            else:
-                return sum(d[dep].values())
+            self.n_gpus = cupy.cuda.runtime.getDeviceCount()
+
+        self.process_dir()
 
     @staticmethod
-    def lines(pfin):
+    def filter_lines(ls):
         lines = []
-        for line in pfin.read_text(encoding="utf-8").splitlines(keepends=False):
+        for line in ls:
             line = ftfy.fix_text(line)
 
             # Skip short sequences
@@ -72,11 +77,10 @@ class Extractor:
                 continue
 
             lines.append(line)
-
         return lines
 
     def is_pre_or_post_subjs(self, doc: Doc):
-        # Here we know that there is a pv in the doc, but in some cases there is more than one. For instance:
+        # Here we know that there is a pv in the doc, but in some cases there is more than one - even in two main clauses. For instance:
         # Bovendien blijft de particuliere huursector achter bij de overige eigendomscategorieën , het energiebesparingspotentieel is in die sector het grootst .
         for t in doc:
             if "ww|pv" in t.tag_.lower():
@@ -92,89 +96,175 @@ class Extractor:
 
                 yield "pre" if first_subj.i < t.i else "post", t, first_subj
 
-    def calculate_statistics(self):
-        # Disable sentence segmentation
-        # Install with
-        # python -m pip install https://huggingface.co/explosion/nl_udv25_dutchalpino_trf/resolve/main/nl_udv25_dutchalpino_trf-any-py3-none-any.whl
-        nlp = spacy.load("nl_udv25_dutchalpino_trf", exclude=["senter", "sentencizer"])
-        nlp.add_pipe("disable_sbd", before="parser")
-
+    def _reader(self):
         for pfin in tqdm(self.files, desc="File"):
-            lines = self.lines(pfin)
-            for batch in tqdm(minibatch(lines, size=self.batch_size), total=len(lines)//self.batch_size, leave=False, desc="Batch"):
-                docs = nlp.pipe(batch)
-                for doc in docs:
-                    if self.verbose:
-                        print(doc)
+            lines = pfin.read_text(encoding="utf-8").splitlines(keepends=False)
+            for batch in tqdm(minibatch(lines, self.batch_size), total=len(lines)//self.batch_size, desc="Batch"):
+                yield batch
 
-                    # Must contain finite verb (pv; persoonsvorm)
-                    if not any("ww|pv" in t.tag_.lower() for t in doc):
+    def reader(self):
+        for batch in self._reader():
+            self.work_q.put(batch)
+
+        for _ in range(self.n_workers):
+            self.work_q.put("done")
+
+    def process_dir(self):
+        if self.n_workers > 1:
+            self.calculate_statistics_mp()
+        else:
+            self.calculate_statistics_sp()
+
+        self.cleanup()
+        # `self` shoud now contain all the relevant data so we can now call `save` if we want
+
+    def calculate_statistics_sp(self):
+        self.set_cuda(0)
+        nlp = load_nlp()
+
+        for batch in self._reader():
+            self.process_batch(batch, nlp, 0)
+
+    def calculate_statistics_mp(self):
+        with Manager() as manager:
+            self.results_q = manager.Queue(maxsize=self.n_workers)
+            self.work_q = manager.Queue(maxsize=self.n_workers * 10)
+
+            # Create a reader and a writer process
+            reader_proc = Process(target=self.reader)
+            # The reader starts filling up the work_q
+            reader_proc.start()
+
+            gpu_map = {i: (i % self.n_gpus) if self.n_gpus > 0 else 0 for i in range(self.n_workers)}
+            jobs = []
+            for rank in range(self.n_workers):
+                proc = Process(target=self._calculate_statistics_mp, args=(rank, gpu_map[rank]))
+                proc.start()
+                jobs.append(proc)
+
+            # Collect results from queue, which the processes add the results queue when they are done
+            results = [self.results_q.get() for _ in range(self.n_workers)]
+
+            for job in jobs:
+                job.join()
+                job.terminate()
+
+            reader_proc.join()
+            reader_proc.terminate()
+
+            self.merge_result_dicts(results)
+
+    def _calculate_statistics_mp(self, rank, gpuid):
+        self.set_cuda(gpuid)
+        nlp = load_nlp()
+
+        while True:
+            # Get work from the working queue
+            batch = self.work_q.get()
+            if batch == "done":
+                break
+
+            self.process_batch(batch, nlp, rank)
+
+        results = {"dep_token_c": self.dep_token_c,
+                   "dep_lemma_c": self.dep_lemma_c,
+                   "verb_token_c": self.verb_token_c,
+                   "verb_lemma_c": self.verb_lemma_c}
+        self.results_q.put(results)
+
+    def process_batch(self, batch, nlp, rank=0):
+        batch = self.filter_lines(batch)
+
+        docs = nlp.pipe(batch, batch_size=self.batch_size)
+        for doc in docs:
+            if self.verbose and rank == 0:
+                print(doc)
+
+            # Must contain finite verb (pv; persoonsvorm)
+            if not any("ww|pv" in t.tag_.lower() for t in doc):
+                continue
+
+            # Must contain a subject (we later check if the subjects and pv's are related)
+            if not any(t.dep_.lower() == "nsubj" for t in doc):
+                continue
+
+            for token in doc:
+                if token.dep_.lower() not in self.dep_token_c:
+                    self.dep_token_c[token.dep_.lower()] = Counter()
+                self.dep_token_c[token.dep_.lower()][token.text.lower()] += 1
+
+                if token.dep_.lower() not in self.dep_lemma_c:
+                    self.dep_lemma_c[token.dep_.lower()] = Counter()
+                self.dep_lemma_c[token.dep_.lower()][token.lemma_.lower()] += 1
+
+            # An approximation of sentences that contain "non main clauses", i.e. "complex clauses"
+            # As taken from the UD documentation: https://universaldependencies.org/u/overview/complex-syntax.html
+            if not any(t.dep_.lower() in ("csubj", "xcomp", "ccomp", "advcl", "acl", "conj", "acl:relcl") for
+                       t in doc):
+                # So this part is only done for main clauses:
+                for subj_position, pv, subj in self.is_pre_or_post_subjs(doc):
+                    if subj_position is None:
                         continue
 
-                    # Must contain a subject (we later check if the subjects and pv's are related)
-                    if not any(t.dep_.lower() == "nsubj" for t in doc):
-                        continue
+                    self.verb_token_c[subj_position][pv.text.lower()] += 1
+                    self.verb_lemma_c[subj_position][pv.lemma_.lower()] += 1
+                    # put these results into counters depending on pre/post
 
-                    for token in doc:
-                        if token.dep_.lower() not in self.dep_token_c:
-                            self.dep_token_c[token.dep_.lower()] = Counter()
-                        self.dep_token_c[token.dep_.lower()][token.text.lower()] += 1
+                    if self.verbose and rank == 0:
+                        print(subj_position, pv, subj)
 
-                        if token.dep_.lower() not in self.dep_lemma_c:
-                            self.dep_lemma_c[token.dep_.lower()] = Counter()
-                        self.dep_lemma_c[token.dep_.lower()][token.lemma_.lower()] += 1
+            if self.verbose and rank == 0:
+                print()
 
-                    # An approximation of sentences that contain "non main clauses", i.e. "complex clauses"
-                    # As taken from the UD documentation: https://universaldependencies.org/u/overview/complex-syntax.html
-                    if not any(t.dep_.lower() in ("csubj", "xcomp", "ccomp", "advcl", "acl", "conj", "acl:relcl") for
-                                t in doc):
-                        # So this part is only done for main clauses:
-                        for subj_position, pv, subj in self.is_pre_or_post_subjs(doc):
-                            if subj_position is None:
-                                continue
+    def merge_result_dicts(self, results):
+        # Have to give sum() an empty counter as a start item, otherwise will complain that it cannot
+        # sum default start value 0 (int) with counters
+        verb_token_c = {"pre": sum([d["verb_token_c"]["pre"] for d in results], Counter()),
+                        "post": sum([d["verb_token_c"]["post"] for d in results], Counter())}
+        verb_lemma_c = {"pre": sum([d["verb_lemma_c"]["pre"] for d in results], Counter()),
+                        "post": sum([d["verb_lemma_c"]["post"] for d in results], Counter())}
 
-                            self.verb_token_c[subj_position][pv.text.lower()] += 1
-                            self.verb_lemma_c[subj_position][pv.lemma_.lower()] += 1
-                            # put these results into counters depending on pre/post
+        # For tiny datasets, it might be that they do not all have the same tags. So get all of them and then iterate.
+        dep_tags = sorted({k for d in results for k in d["dep_token_c"].keys()})
+        dep_token_c = defaultdict(dict)
+        dep_lemma_c = defaultdict(dict)
+        for tag in dep_tags:
+            dep_token_c[tag] = sum([d["dep_token_c"][tag] if tag in d["dep_token_c"] else Counter() for d in results],
+                                   Counter())
+            dep_lemma_c[tag] = sum([d["dep_lemma_c"][tag] if tag in d["dep_token_c"] else Counter() for d in results],
+                                   Counter())
 
-                            if self.verbose:
-                                print(subj_position, pv, subj)
+        self.dep_token_c = dict(dep_token_c)
+        self.dep_lemma_c = dict(dep_lemma_c)
+        self.verb_token_c = verb_token_c
+        self.verb_lemma_c = verb_lemma_c
 
-                    if self.verbose:
-                        print()
+    def cleanup(self):
+        self.results_q = None
+        self.work_q = None
 
-    def get_word_as_subj_freq(self, word):
-        as_subj = self.dep_lemma_c["nsubj"][word]
-        total = sum([c[word] for c in self.dep_lemma_c.values()])
-        return as_subj, total-as_subj
+    def set_cuda(self, gpuid):
+        if not self.no_cuda:
+            cupy.cuda.Device(gpuid).use()
+            set_gpu_allocator("pytorch")
+            require_gpu(gpuid)
 
-    def add_freq_to_df(self, xlsx: Union[str, PathLike], outfile: Union[str, PathLike] = "frequencies.txt"):
-        df = pd.read_excel(xlsx)
+    def save(self, outfile: Union[str, PathLike]="extractor.pckl"):
+        results = {"dep_token_c": self.dep_token_c,
+                   "dep_lemma_c": self.dep_lemma_c,
+                   "verb_token_c": self.verb_token_c,
+                   "verb_lemma_c": self.verb_lemma_c}
 
-        for row_idx, row in df.iterrows():
-            fin_verb, main_verb, head_subj_lemma = row
+        with open(outfile, "wb") as fhout:
+            pickle.dump(results, fhout)
 
-            if not pd.isna(fin_verb):
-                df.at[row_idx, "1A_pre_tok_finverb"] = self.verb_token_c["pre"][fin_verb.lower()]
-                df.at[row_idx, "1B_post_tok_finverb"] = self.verb_token_c["post"][fin_verb.lower()]
 
-                df.at[row_idx, "2A_pre_lem_finverb"] = self.verb_lemma_c["pre"][fin_verb.lower()]
-                df.at[row_idx, "2B_post_lem_finverb"] = self.verb_lemma_c["post"][fin_verb.lower()]
-
-            if not pd.isna(main_verb):
-                df.at[row_idx, "3A_pre_lem_mainverb"] = self.verb_lemma_c["pre"][main_verb.lower()]
-                df.at[row_idx, "3B_post_lem_mainverb"] = self.verb_lemma_c["post"][main_verb.lower()]
-
-            if not pd.isna(head_subj_lemma):
-                n_as_subj, n_not_subj = self.get_word_as_subj_freq(head_subj_lemma)
-                df.at[row_idx, "4A_tok_subj"] = n_as_subj
-                df.at[row_idx, "4B_tok_not_subj"] = n_not_subj
-
-        print(df.head(10))
-
-    def save(self):
-        with open(self.outfile, "wb") as fhout:
-            pickle.dump(self, fhout)
+def load_nlp():
+    # Install with
+    # python -m pip install https://huggingface.co/explosion/nl_udv25_dutchalpino_trf/resolve/main/nl_udv25_dutchalpino_trf-any-py3-none-any.whl
+    nlp = spacy.load("nl_udv25_dutchalpino_trf", exclude=["senter", "sentencizer", "ner", "textcat"])
+    nlp.add_pipe("disable_sbd", before="parser")
+    return nlp
 
 
 @Language.factory("disable_sbd")
@@ -196,30 +286,26 @@ if __name__ == "__main__":
     import argparse
 
     cparser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    csubparsers = cparser.add_subparsers(dest="subparser_name")
 
-    cextract = csubparsers.add_parser("extract")
-    cextract.add_argument("indir", help="Path to input directory with text files. These files constitute the corpus that will be parsed and used to calculate frequencies")
-    cextract.add_argument("-e", "--ext", default="",
+    cparser.add_argument("indir", help="Path to input directory with text files. These files constitute the corpus"
+                                       " that will be parsed and used to calculate frequencies")
+    cparser.add_argument("-e", "--ext", default="",
                          help="Only process files with this extension (must include a dot).")
-    cextract.add_argument("-o", "--outfile", default="extractor.pckl",
-                         help="Path of the output file to save the final object and all frequencies to. If not given, writes to extractor.pckl.")
-    cextract.add_argument("-b", "--batch_size", default=64, type=int, help="Mini-batch size to process at a time. Larger = faster but may lead to out of memory issues.")
-    cextract.add_argument("-v", "--verbose", action="store_true", help="Print information of matching tokens.")
-
-    ccollect = csubparsers.add_parser("collect")
-    ccollect.add_argument("pickle_f", help="Path to previously created, pickled Extractor file that contains the needed frequencies.")
-    ccollect.add_argument("xlsx", help="Excel file that contains the words whose values we need to supplement.")
-    ccollect.add_argument("-o", "--outfile", default="frequencies.txt",
-                         help="Path of the output file, must end with .txt. If not given, writes to frequencies.txt.")
+    cparser.add_argument("-o", "--outfile", default="extractor.pckl",
+                         help="Path of the output file to save the final object and all frequencies to. If not given,"
+                              "  writes to extractor.pckl.")
+    cparser.add_argument("-b", "--batch_size", default=64, type=int,
+                         help="Mini-batch size to process at a time.Larger = faster but may lead to out"
+                              " of memory issues.")
+    cparser.add_argument("-n", "--n_workers", default=1, type=int,
+                         help="Number of workers to use. Note that if CUDA is enabled (default), the workers will"
+                              " automatically be distributed across all available GPUs!")
+    cparser.add_argument("-v", "--verbose", action="store_true", default=False,
+                         help="Print information of matching tokens.")
+    cparser.add_argument("--no_cuda", action="store_true", default=False,
+                         help="To disable CUDA. If CUDA-capable software is not detected, CUDA will not be used.")
 
     cargs = vars(cparser.parse_args())
-    cparser_name = cargs.pop("subparser_name")
-    if cparser_name == "extract":
-        extractor = Extractor(**cargs)
-        extractor.save()
-    else:
-        with open(cargs["pickle_f"], "rb") as fhin:
-            extractor = pickle.load(fhin)
-
-        extractor.add_freq_to_df(cargs["xlsx"], cargs["outfile"])
+    coutfile = cargs.pop("outfile")
+    extractor = FrequencyExtractor(**cargs)
+    extractor.save(coutfile)
