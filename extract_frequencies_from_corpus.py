@@ -5,6 +5,7 @@ import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 import multiprocessing as mp
+from math import ceil
 from multiprocessing import Manager, Process, Queue
 from os import PathLike
 from pathlib import Path
@@ -113,7 +114,8 @@ class FrequencyExtractor:
     def _reader(self):
         for pfin in tqdm(self.files, desc="File"):
             lines = pfin.read_text(encoding="utf-8").splitlines(keepends=False)
-            for batch in tqdm(minibatch(lines, self.batch_size), total=len(lines)//self.batch_size, desc="Batch"):
+            total = ceil(len(lines)/self.batch_size)
+            for batch in tqdm(minibatch(lines, self.batch_size), total=total, desc="Batch"):
                 yield batch
 
     def reader(self):
