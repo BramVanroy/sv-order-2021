@@ -115,7 +115,7 @@ class FrequencyExtractor:
         for pfin in tqdm(self.files, desc="File"):
             lines = pfin.read_text(encoding="utf-8").splitlines(keepends=False)
             total = ceil(len(lines)/self.batch_size)
-            for batch in tqdm(minibatch(lines, self.batch_size), total=total, desc="Batch"):
+            for batch in tqdm(minibatch(lines, self.batch_size), total=total, leave=False, desc="Batch"):
                 yield batch
 
     def reader(self):
