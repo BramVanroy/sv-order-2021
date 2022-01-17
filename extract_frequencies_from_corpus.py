@@ -52,6 +52,8 @@ class FrequencyExtractor:
     dep_lemma_c: Dict = field(default_factory=dict, init=False)
     verb_token_c: Dict = field(default_factory=dict, init=False)
     verb_lemma_c: Dict = field(default_factory=dict, init=False)
+    subj_token_c: Dict = field(default_factory=dict, init=False)
+    subj_lemma_c: Dict = field(default_factory=dict, init=False)
     n_tokens_processed: int = field(default=0, init=False)
     n_sents_processed: int = field(default=0, init=False)
 
@@ -63,6 +65,8 @@ class FrequencyExtractor:
         self.files = list(Path(self.indir).glob(f"*{self.ext}"))
         self.verb_token_c = {"pre": Counter(), "post": Counter()}
         self.verb_lemma_c = {"pre": Counter(), "post": Counter()}
+        self.subj_token_c = {"pre": Counter(), "post": Counter()}
+        self.subj_lemma_c = {"pre": Counter(), "post": Counter()}
 
         if (not CUPY_AVAILABLE or not TORCH_CUDA_AVAILABLE) and self.n_gpus > 0:
             logging.warning(f"CUDA requested, but environment does not support it! Disabling...\n"
@@ -184,6 +188,8 @@ class FrequencyExtractor:
                    "dep_lemma_c": self.dep_lemma_c,
                    "verb_token_c": self.verb_token_c,
                    "verb_lemma_c": self.verb_lemma_c,
+                   "subj_token_c": self.subj_token_c,
+                   "subj_lemma_c": self.subj_lemma_c,
                    "n_tokens_processed": self.n_tokens_processed,
                    "n_sents_processed": self.n_sents_processed}
 
@@ -224,6 +230,8 @@ class FrequencyExtractor:
 
                     self.verb_token_c[subj_position][pv.text.lower()] += 1
                     self.verb_lemma_c[subj_position][pv.lemma_.lower()] += 1
+                    self.subj_token_c[subj_position][subj.text.lower()] += 1
+                    self.subj_lemma_c[subj_position][subj.lemma_.lower()] += 1
 
                     if self.verbose and rank == 0:
                         print(subj_position, pv, subj)
@@ -241,6 +249,10 @@ class FrequencyExtractor:
                         "post": sum([d["verb_token_c"]["post"] for d in results], Counter())}
         verb_lemma_c = {"pre": sum([d["verb_lemma_c"]["pre"] for d in results], Counter()),
                         "post": sum([d["verb_lemma_c"]["post"] for d in results], Counter())}
+        subj_token_c = {"pre": sum([d["subj_token_c"]["pre"] for d in results], Counter()),
+                        "post": sum([d["subj_token_c"]["post"] for d in results], Counter())}
+        subj_lemma_c = {"pre": sum([d["subj_lemma_c"]["pre"] for d in results], Counter()),
+                        "post": sum([d["subj_lemma_c"]["post"] for d in results], Counter())}
 
         # For tiny datasets, it might be that they do not all have the same tags. So get all of them and then iterate.
         dep_tags = sorted({k for d in results for k in d["dep_token_c"].keys()})
@@ -256,6 +268,8 @@ class FrequencyExtractor:
         self.dep_lemma_c = dict(dep_lemma_c)
         self.verb_token_c = verb_token_c
         self.verb_lemma_c = verb_lemma_c
+        self.subj_token_c = subj_token_c
+        self.subj_lemma_c = subj_lemma_c
 
         self.n_tokens_processed = sum([d["n_tokens_processed"] for d in results])
         self.n_sents_processed = sum([d["n_sents_processed"] for d in results])
@@ -288,6 +302,8 @@ class FrequencyExtractor:
                    "dep_lemma_c": self.dep_lemma_c,
                    "verb_token_c": self.verb_token_c,
                    "verb_lemma_c": self.verb_lemma_c,
+                   "subj_token_c": self.verb_token_c,
+                   "subj_lemma_c": self.verb_lemma_c,
                    "n_tokens_processed": self.n_tokens_processed,
                    "n_sents_processed": self.n_sents_processed}
 
