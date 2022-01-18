@@ -302,8 +302,8 @@ class FrequencyExtractor:
                    "dep_lemma_c": self.dep_lemma_c,
                    "verb_token_c": self.verb_token_c,
                    "verb_lemma_c": self.verb_lemma_c,
-                   "subj_token_c": self.verb_token_c,
-                   "subj_lemma_c": self.verb_lemma_c,
+                   "subj_token_c": self.subj_token_c,
+                   "subj_lemma_c": self.subj_lemma_c,
                    "n_tokens_processed": self.n_tokens_processed,
                    "n_sents_processed": self.n_sents_processed}
 
