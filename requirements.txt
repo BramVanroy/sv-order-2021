@@ -1,0 +1,7 @@
+ftfy
+spacy>=3.0
+spacy-experimental
+https://huggingface.co/explosion/nl_udv25_dutchalpino_trf/resolve/main/nl_udv25_dutchalpino_trf-any-py3-none-any.whl
+tqdm
+pandas
+lxml
