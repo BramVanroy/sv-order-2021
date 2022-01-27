@@ -1,10 +1,11 @@
 """Get relevant data from TMX/XML and save as tab-separated file. Meant to be run on TMX files and extracting
-linguistic features for both French (src) and Dutch (tgt).
+linguistic features for both French (src) and Dutch (tgt). It was used to extract linguistic features from a
+pre-parsed XML/TMX corpus.
 """
 
 from os import PathLike
 from pathlib import Path
-from typing import Union
+from typing import Generator, Optional, Union
 
 import lxml
 from lxml import etree
@@ -13,12 +14,22 @@ from pandas import DataFrame
 
 
 def get_feats(token_xml: Element) -> str:
+    """Get lemma, pos, xpos, ufeats of a given element
+    :param token_xml: token XML element
+    :return: the properties, joined as a string
+    """
     all_feats = [token_xml.find(el).text for el in ("lemma", "upos", "xpos", "ufeats")]
     all_feats = [f if f else "_" for f in all_feats]
     return "-".join(all_feats)
 
 
-def process_file(pfin: Union[str, PathLike], text_id: int):
+def process_file(pfin: Union[str, PathLike], text_id: int) -> Optional[Generator]:
+    """For a given XML/TMX file, yield for each segment the file name without .prep, text ID, segment ID,
+    src and tgt texts and the source and target linguistic features
+    :param pfin: input file
+    :param text_id: this text's ID
+    :return: a generator yielding the required information, or None when the file is not valid XML
+    """
     nsmap = {"xml": "http://www.w3.org/XML/1998/namespace"}
     try:
         tree: ElementTree = etree.parse(str(pfin))
@@ -41,6 +52,12 @@ def process_file(pfin: Union[str, PathLike], text_id: int):
 
 
 def process(indir: Union[str, PathLike], outfile: Union[str, PathLike, None] = None, ext: str = ".tmx"):
+    """Process all files with a given extension in a given input directory and write the results as a tab-separated
+    file to an outputfile
+    :param indir: the input dir
+    :param outfile: the output file to write results to. Writes to "data/lingfeats_output.txt" if not given
+    :param ext: only process files with this extension
+    """
     if outfile is not None and not outfile.endswith(".txt"):
         raise ValueError("'outfile' must end with .txt")
     pdin = Path(indir).resolve()

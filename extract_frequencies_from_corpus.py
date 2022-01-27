@@ -1,6 +1,5 @@
-"""
-Data used: SONAR, only written-to-be-read, published (WRP-) and NOT WRPEA, which contains forum posts (bad spelling, hard to parse)
-"""
+"""Extract general token/lemma frequencies and subject-verb order information from a large corpus. We use a
+ multi-processing, producer-consumer pattern to efficiently parse the data with spaCy."""
 import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -10,7 +9,7 @@ from multiprocessing import Manager, Process, Queue
 from os import PathLike
 from pathlib import Path
 import pickle
-from typing import Dict, List, Optional, Union
+from typing import Dict, Generator, Iterable, List, Optional, Union
 import warnings
 
 import ftfy
@@ -83,7 +82,12 @@ class FrequencyExtractor:
         self.no_cuda = self.n_gpus < 1
         self.process_dir()
 
-    def filter_lines(self, ls):
+    def filter_lines(self, ls: Iterable[str]):
+        """Given a batch of lines, fix them with ftfy, and filter them so that only those within a given length
+        (self.min, self.max) are returned.
+        :param ls: the list of input lines
+        :return: the list of filtered lines
+        """
         lines = []
         for line in ls:
             line = ftfy.fix_text(line)
@@ -98,9 +102,16 @@ class FrequencyExtractor:
 
         return lines
 
-    def is_pre_or_post_subjs(self, doc: Doc):
-        # Here we know that there is a pv in the doc, but in some cases there is more than one - even in two main clauses. For instance:
-        # Bovendien blijft de particuliere huursector achter bij de overige eigendomscategorieën , het energiebesparingspotentieel is in die sector het grootst .
+    def is_pre_or_post_subjs(self, doc: Doc) -> Generator:
+        """In a given spaCy doc, find all finite verbs (tag: ww|pv) and their corresponding subject(s). Only the
+        first of those subjects is used.
+        :param doc: a spaCy doc
+        :return: a generator that yields the position of the subject ("pre" or "post"), the finite verb token,
+        and the subject token
+        """
+        # Here we know that there is a pv in the doc, but in some cases there is more than one. E.g., on one line:
+        # "Bovendien blijft de particuliere huursector achter bij de overige eigendomscategorieën ,
+        # het energiebesparingspotentieel is in die sector het grootst ."
         for t in doc:
             if "ww|pv" in t.tag_.lower():
                 # Get subjects that are on the "same level" of the finite verb
@@ -116,6 +127,7 @@ class FrequencyExtractor:
                 yield "pre" if first_subj.i < t.i else "post", t, first_subj
 
     def _reader(self):
+        """A producer that reads and yields batches from all files based on self.files and self.batch_size."""
         for pfin in tqdm(self.files, desc="File"):
             lines = pfin.read_text(encoding="utf-8").splitlines(keepends=False)
             total = ceil(len(lines)/self.batch_size)
@@ -123,6 +135,8 @@ class FrequencyExtractor:
                 yield batch
 
     def reader(self):
+        """The main reader process, to be used in a separate process to continuously produce new data for
+         the child processes to process."""
         for batch in self._reader():
             self.work_q.put(batch)
 
@@ -130,6 +144,8 @@ class FrequencyExtractor:
             self.work_q.put("done")
 
     def process_dir(self):
+        """Main entry point to start processing all the files in a directory. Depending on self.n_workers,
+        a distributed or single process approach is taken."""
         if self.n_workers > 1:
             self.calculate_statistics_mp()
         else:
@@ -138,6 +154,7 @@ class FrequencyExtractor:
         # `self` should now contain all the relevant data so we can now call `save` if we want
 
     def calculate_statistics_sp(self):
+        """Start processing batches within one, main process"""
         self.set_cuda(0)
         nlp = self.load_nlp()
 
@@ -145,6 +162,7 @@ class FrequencyExtractor:
             self.process_batch(batch, nlp, 0)
 
     def calculate_statistics_mp(self):
+        """Start up a multi-processing approach"""
         with Manager() as manager:
             self.results_q = manager.Queue(maxsize=self.n_workers)
             self.work_q = manager.Queue(maxsize=self.n_workers * 10)
@@ -172,7 +190,13 @@ class FrequencyExtractor:
             reader_proc.terminate()
             self.merge_result_dicts(results)
 
-    def _calculate_statistics_mp(self, rank, gpuid):
+    def _calculate_statistics_mp(self, rank: int, gpuid: int):
+        """Starts a child process that has its own spaCy parser, potentially running on a GPU.
+        :param rank: the ID of this child process
+        :param gpuid: the ID of the GPU to use (0 if not used, which will have no effect in that case)
+        :return: when the producer queue is empty, all this process' collected frequencies are copied into
+        a "results" dictionary, which is put into the results_q. This in turn will be processed by the main process
+        """
         self.set_cuda(gpuid)
         nlp = self.load_nlp()
 
@@ -195,7 +219,13 @@ class FrequencyExtractor:
 
         self.results_q.put(results)
 
-    def process_batch(self, batch, nlp, rank=0):
+    def process_batch(self, batch: Iterable[str], nlp: Language, rank: int = 0):
+        """Extract frequencies from a single given batch by means of a given NLP object
+        :param batch: the batch of lines to process
+        :param nlp: the spaCy language object to use for parsing
+        :param rank: Only used to print some example results when rank = 0 and self.verbose
+        :return: all frequencies are stored in self for easy retrieval later on
+        """
         batch = self.filter_lines(batch)
         docs = nlp.pipe(batch, batch_size=self.batch_size)
         for doc in docs:
@@ -242,7 +272,12 @@ class FrequencyExtractor:
             if self.verbose and rank == 0:
                 print()
 
-    def merge_result_dicts(self, results):
+    def merge_result_dicts(self, results: Iterable[dict]):
+        """Merge all the resulting dictionaries of child processes into one main dictionary
+        :param results: the output of all child processes, so a list of dictionaries
+        :return: after merging, the resulting values are set to self, so that the required information
+        is in the main process' class instance. This perfectly mimicks single-processing behavior
+        """
         # Have to give sum() an empty counter as a start item, otherwise will complain that it cannot
         # sum default start value 0 (int) with counters
         verb_token_c = {"pre": sum([d["verb_token_c"]["pre"] for d in results], Counter()),
@@ -275,6 +310,10 @@ class FrequencyExtractor:
         self.n_sents_processed = sum([d["n_sents_processed"] for d in results])
 
     def load_nlp(self):
+        """Load a spaCy model with the current process. If the data is pretokenized, we disable the tokenization step.
+        Note that we always use the, currently experimental, Dutch UD v2.5 model for best performance.
+        The rest of the code relies on this model, specifically to select a finite verb based on the ww|pv tag.
+        Sentence segmentation is disabled."""
         # Install with
         # python -m pip install https://huggingface.co/explosion/nl_udv25_dutchalpino_trf/resolve/main/nl_udv25_dutchalpino_trf-any-py3-none-any.whl
         if self.is_tokenized:
@@ -291,13 +330,16 @@ class FrequencyExtractor:
 
         return nlp
 
-    def set_cuda(self, gpuid):
+    def set_cuda(self, gpuid: int):
+        """If cuda is enabled, select and set the requested GPU ID"""
         if not self.no_cuda:
             cupy.cuda.Device(gpuid).use()
             use_pytorch_for_gpu_memory()
             require_gpu(gpuid)
 
     def save(self, outfile: Union[str, PathLike] = "extractor.pckl"):
+        """After processing, the results can be "saved", which effectively pickles the important frequencies in
+        a reusable format. This pickle can then later be used to analyse/visualize the data."""
         results = {"dep_token_c": self.dep_token_c,
                    "dep_lemma_c": self.dep_lemma_c,
                    "verb_token_c": self.verb_token_c,
