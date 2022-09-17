@@ -1,0 +1,24 @@
+python extract_frequencies_from_corpus.py data/sonar_plaintext/ -e .txt -o freqs_new.pickle -n 12 --n_gpus 4 -b 256 --min 3 --max 32 --is_tokenized
+
+
+1.	Data geselecteerd. Onderdelen uit SONAR: alle written-to-be-read, published (WRP-) componenten behalve WRPEA dat discussiefora bevat, met slechte spelling en internettaal - wat moeilijk te parsen is. Zinnen korter dan drie woorden (meestal opsommingen “1 .”) of langer dan 32 woorden werden niet meegenomen.
+2.	Automatisch de finiete werkwoorden gelemmatiseerd, maar gegeven de weinig context was die kwaliteit niet hoog. Dus heb ze manueel geverifieerd. Deze staan in de kolom “finite verb lemma”.
+3.	Bij bovenstaande kwam ik, volgens mij, ook twee typfoutjes tegen in de eerste kolom. Lijn 454: eb -> heb, lijn 335: zulen -> zullen. Aangepast.
+4.	De data geparset en frequenties in het corpus berekend. Het duurt (na wat optimaliseren) ongeveer 5-6u om het script te draaien als alle hardware beschikbaar is op onze servers (nu tijdens de vakantie heb ik daar dus wat geluk mee). Deze frequenties heb ik opgeslagen in een toegankelijk formaat in Python voor later gebruik als dat nodig is.
+5.	De relevante frequenties uit ge-extraheerd uit bovenstaande en toegevoegd als extra kolommen, gebaseerd op je onderstaande mail. In alle gevallen wordt er met lowercase gewerkt (de frequenties werden ook berekend op lowercased data):
+	a.	1A_pre_tok_finverb: hoe vaak komt het token uit “finite verb forms” voor met een preverbaal subject
+	b.	1B_post_tok_finverb: hoe vaak komt het token uit “finite verb forms” voor met een postverbaal subject
+	c.	2A_pre_lem_finverb: hoe vaak komt het lemma uit “finite verb forms” (dat is dus “finite verb lemma”) voor met een preverbaal subject
+	d.	2B_post_lem_finverb: hoe vaak komt het lemma uit “finite verb forms” (dat is dus “finite verb lemma”) voor met een postverbaal subject
+	e.	3A_pre_lem_mainverb: hoe vaak komt het lemma uit “main verb lemmas” voor met een preverbaal subject
+	f.	3B_post_lem_mainverb: hoe vaak komt het lemma uit “main verb lemmas” voor met een postverbaal subject
+	g.	4A_lemma_subj: hoe vaak komt het lemma uit “head_subject_lemma” voor als subject
+	h.	4B_lemma_not_subj: hoe vaak komt het lemma uit “head_subject_lemma” voor als niet-subject
+6.	Wat verdere statistieken, waarvan ook de C- en D-puntjes die je hieronder vroeg.
+	a.	Aantal zinnen verwerkt: 20,089,029
+	b.	Aantal tokens verwerkt: 304,526,362
+	c.	Aantal subjecten: 28,303,547 (merk op dat er meer subjecten zijn dan zinnen, dat komt doordat deze statistieken berekend zijn op basis van zowel hoofd- en bijzinnen, zoals deel 4)
+	d.	Aantal niet-subjecten: 276,222,815
+	e.	Aantal unieke tokens: 5,596,018
+	f.	Aantal unieke subjecten: 704,421
+	g.	Aantal unieke niet-subjecten: 4,891,597
