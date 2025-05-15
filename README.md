@@ -35,4 +35,21 @@ of the scope of our research objectives, but also makes the job of the parser ve
 Sentences shorter than three words (e.g. enumerations like "1 .") or longer than 32 words were excluded. The latter 
 restriction for computational feasibility.
 
+Citation
+--------
 
+```bibtex
+@ARTICLE{De_Sutter2023-si,
+  title     = "Is linguistic decision-making constrained by the same cognitive
+               factors in student and in professional translation?",
+  author    = "De Sutter, Gert and Lefer, Marie-Aude and Vanroy, Bram",
+  journal   = "Int. J. Learn. Corpus Res.",
+  publisher = "John Benjamins Publishing Company",
+  volume    =  9,
+  number    =  1,
+  pages     = "60--95",
+  month     =  apr,
+  year      =  2023,
+  language  = "en"
+}
+```
